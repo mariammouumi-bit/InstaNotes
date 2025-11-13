@@ -1,9 +1,10 @@
 // backend/server.js
-// Express backend without Stripe
-// - Supabase auth (requires SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY env vars)
-// - Optional Redis rate limiter (use REDIS_URL env var)
-// - /api/summarize (protected) uses OpenAI if OPENAI_API_KEY is set, otherwise extractive fallback
-// Install deps in backend: npm install express body-parser @supabase/supabase-js ioredis
+// Express backend with /api/ocr and /api/summarize endpoints
+// Requirements:
+//  - Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (for saving summaries)
+//  - OPTIONAL: set OPENAI_API_KEY to enable OpenAI summarization
+//  - OPTIONAL: set GOOGLE_VISION_API_KEY to enable OCR via Google Vision
+// Install: npm install express body-parser @supabase/supabase-js ioredis multer
 
 const express = require('express');
 const bodyParser = require('body-parser');
@@ -15,42 +16,50 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const REDIS_URL = process.env.REDIS_URL || null;
 const DISABLE_OPENAI = String(process.env.DISABLE_OPENAI || '').trim() === '1';
+const GOOGLE_VISION_API_KEY = process.env.GOOGLE_VISION_API_KEY || null;
 
-// Initialize Supabase admin client (service role)
+// Supabase admin client (service role) — optional but used to save summaries
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 } else {
-  console.warn('SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Supabase DB logging / auth may fail.');
+  console.warn('SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set. Supabase DB logging / auth may be disabled.');
 }
 
-// Optional Redis for rate limiting
-let Redis = null;
+// Redis (optional) for rate limiting
 let redis = null;
 try {
   if (REDIS_URL) {
-    Redis = require('ioredis');
-    redis = new Redis(REDIS_URL);
+    const IORedis = require('ioredis');
+    redis = new IORedis(REDIS_URL);
     redis.on('error', (e) => console.error('Redis error', e));
     console.log('Connected to Redis for rate limiting.');
   } else {
-    console.log('No REDIS_URL provided — using in-memory rate limiter (not for production).');
+    console.log('No REDIS_URL provided — using in-memory rate limiter (dev only).');
   }
 } catch (err) {
-  console.warn('ioredis not installed or failed to initialize; continuing without Redis:', err.message);
+  console.warn('ioredis not installed or failed — continuing without Redis.', err.message);
   redis = null;
 }
 
+// Multer for uploads (ensure installed)
+let multer = null;
+let upload = null;
+try {
+  multer = require('multer');
+  upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+} catch (err) {
+  console.warn('multer not installed; /api/ocr will be unavailable until you install multer.');
+  multer = null;
+  upload = null;
+}
+
 const app = express();
+app.use(bodyParser.json({ limit: '400kb' }));
 
-// Use JSON parser
+// Simple CORS (tighten in production)
 app.use((req, res, next) => {
-  bodyParser.json({ limit: '400kb' })(req, res, next);
-});
-
-// Simple CORS for testing (tighten for production)
-app.use((req, res, next) => {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // restrict in prod
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
@@ -58,6 +67,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/', (req, res) => res.send('InstaNotes backend running'));
+app.get('/_healthcheck_ocr', (req, res) => res.json({ ok: true, now: Date.now() }));
 
 /* ---------------------------
    Rate limiter (per-user)
@@ -95,7 +105,7 @@ function userRateLimiter({ limit = 60, windowSec = 60 } = {}) {
 
 /* ---------------------------
    Auth middleware using Supabase JWT
-   - Expects Authorization: Bearer <access_token>
+   expects Authorization: Bearer <access_token>
 ----------------------------*/
 async function requireAuth(req, res, next) {
   try {
@@ -104,7 +114,7 @@ async function requireAuth(req, res, next) {
     if (!token) return res.status(401).json({ error: 'Missing Authorization token' });
 
     if (!supabase) {
-      console.warn('Supabase client not initialized; rejecting auth.');
+      console.warn('Supabase not configured; rejecting auth.');
       return res.status(500).json({ error: 'Server misconfiguration: Supabase not configured' });
     }
 
@@ -127,19 +137,18 @@ async function requireAuth(req, res, next) {
 ----------------------------*/
 app.post('/api/summarize', requireAuth, userRateLimiter({ limit: 60, windowSec: 60 }), async (req, res) => {
   try {
-    let { text, model } = req.body || {};
+    let { text } = req.body || {};
     if (typeof text !== 'string' || !text.trim()) return res.status(400).json({ error: 'Missing text' });
-    model = model || process.env.OPENAI_MODEL || 'gpt-3.5-turbo';
 
     if (DISABLE_OPENAI || !OPENAI_KEY) {
-      console.log('[summarize] using extractive fallback');
       const extractive = summarizeExtractive(text, 3);
       await saveSummaryToDB(req.user.id, text, extractive, 'extractive', null);
       return res.json({ summary: extractive, source: 'extractive' });
     }
 
+    // Call OpenAI Chat Completions
     const payload = {
-      model,
+      model: process.env.OPENAI_MODEL || 'gpt-3.5-turbo',
       messages: [
         { role: 'system', content: 'Vat de tekst kort samen in Nederlandse bullets.' },
         { role: 'user', content: text }
@@ -165,14 +174,8 @@ app.post('/api/summarize', requireAuth, userRateLimiter({ limit: 60, windowSec: 
     if (json?.choices && json.choices[0]?.message?.content) summary = json.choices[0].message.content;
     else if (json?.choices && json.choices[0]?.text) summary = json.choices[0].text;
 
-    const usage = json?.usage || null;
-    let costEstimate = null;
-    if (usage && usage.total_tokens) {
-      costEstimate = usage.total_tokens * 0.000002;
-    }
-
-    await saveSummaryToDB(req.user.id, text, summary, 'openai', costEstimate);
-    return res.json({ summary, source: 'openai', usage });
+    await saveSummaryToDB(req.user.id, text, summary, 'openai', null);
+    return res.json({ summary, source: 'openai' });
   } catch (err) {
     console.error('/api/summarize unexpected', err);
     return res.status(500).json({ error: String(err) });
@@ -180,7 +183,74 @@ app.post('/api/summarize', requireAuth, userRateLimiter({ limit: 60, windowSec: 
 });
 
 /* ---------------------------
-   Simple extractive summarizer
+   OCR endpoint (POST /api/ocr)
+   - expects multipart/form-data field "image"
+   - requires multer to be installed
+   - uses Google Vision if GOOGLE_VISION_API_KEY is set
+----------------------------*/
+app.post(
+  '/api/ocr',
+  requireAuth,
+  userRateLimiter({ limit: 20, windowSec: 60 }),
+  (req, res, next) => {
+    if (!upload) {
+      return res.status(501).json({ error: 'OCR disabled: multer not installed. Run `npm install multer` in backend.' });
+    }
+    upload.single('image')(req, res, (err) => {
+      if (err) {
+        console.error('/api/ocr upload error', err);
+        return res.status(400).json({ error: 'Upload error', details: String(err.message || err) });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'Missing image file (field name "image")' });
+
+      if (!GOOGLE_VISION_API_KEY) {
+        return res.status(501).json({
+          error: 'No OCR provider configured. Set GOOGLE_VISION_API_KEY env var to enable OCR via Google Vision.'
+        });
+      }
+
+      const imageBase64 = req.file.buffer.toString('base64');
+      const visionPayload = {
+        requests: [
+          {
+            image: { content: imageBase64 },
+            features: [{ type: 'TEXT_DETECTION', maxResults: 1 }]
+          }
+        ]
+      };
+
+      const visionRes = await fetch(`https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(visionPayload)
+      });
+
+      const visionJson = await visionRes.json().catch(() => null);
+      if (!visionRes.ok) {
+        console.error('/api/ocr vision error', visionRes.status, visionJson);
+        return res.status(visionRes.status).json({ error: 'Vision API error', details: JSON.stringify(visionJson).slice(0, 1000) });
+      }
+
+      const text =
+        visionJson?.responses?.[0]?.fullTextAnnotation?.text ||
+        visionJson?.responses?.[0]?.textAnnotations?.[0]?.description ||
+        '';
+
+      return res.json({ text: text || '' });
+    } catch (err) {
+      console.error('/api/ocr unexpected', err);
+      return res.status(500).json({ error: String(err) });
+    }
+  }
+);
+
+/* ---------------------------
+   simple extractive summarizer
 ----------------------------*/
 function summarizeExtractive(inputText, maxSentences = 3) {
   const text = (inputText || '').replace(/\r\n/g, ' ').replace(/\n/g, ' ');
